@@ -99,6 +99,7 @@
             currentPolicies: [],
             sessionPhase: null, 
             nextPhaseData: null, 
+            isWakeLockActive: false, // Tracks user's preference for screen wake lock
         };
 
         // --- Game State Initialization (Load from storage or use default) ---
@@ -106,6 +107,55 @@
         // Use Object.assign to merge the loaded state over the default, providing resilience
         const gameState = Object.assign({}, DEFAULT_GAME_STATE, loadedState);
 
+        // --- Wake Lock Management ---
+        let wakeLockSentinel = null;
+
+        const requestWakeLock = async () => {
+            if (!('wakeLock' in navigator)) {
+                console.warn("Wake Lock API not supported.");
+                gameState.isWakeLockActive = false; // Disable if not supported
+                render();
+                return;
+            }
+            if (wakeLockSentinel) return; // Already active
+
+            try {
+                wakeLockSentinel = await navigator.wakeLock.request('screen');
+                wakeLockSentinel.addEventListener('release', () => {
+                    console.log('Wake Lock released by system or manually.');
+                    wakeLockSentinel = null;
+                    gameState.isWakeLockActive = false;
+                    render(); 
+                });
+                console.log('Wake Lock successfully requested.');
+                gameState.isWakeLockActive = true;
+            } catch (err) {
+                console.error('Failed to acquire Wake Lock (User permission denied or system policy):', err);
+                gameState.isWakeLockActive = false;
+                wakeLockSentinel = null;
+            }
+            render(); 
+        };
+
+        const releaseWakeLock = () => {
+            if (wakeLockSentinel) {
+                wakeLockSentinel.release();
+                wakeLockSentinel = null;
+                gameState.isWakeLockActive = false;
+                console.log('Wake Lock manually released.');
+            }
+            render(); 
+        };
+        
+        // Handle visibility changes (re-request if the lock was active but dropped when the tab went invisible)
+        document.addEventListener('visibilitychange', () => {
+            if (gameState.isWakeLockActive && document.visibilityState === 'visible' && !wakeLockSentinel) {
+                // If the user preferred the lock, and the tab becomes visible, re-request it.
+                requestWakeLock();
+            } 
+        });
+        
+        // --- Game Logic continues ---
 
         // --- CORRECTED ROLE AND BOARD DISTRIBUTION (Using user's provided power positions) ---
         // Powers array indices 0-5 correspond to F1-F6 policy slots.
@@ -396,12 +446,24 @@
         };
 
         const handleResetGame = () => {
-            // Reset to the default state and clear any loaded state
+            // Store the wake lock preference before reset
+            const wasWakeLockActive = gameState.isWakeLockActive;
+
+            // Reset to the default state
             Object.assign(gameState, DEFAULT_GAME_STATE);
+            
+            // Restore the wake lock setting on reset
+            gameState.isWakeLockActive = wasWakeLockActive;
+            
+            // Clear all data *except* the wake lock setting from local storage
             clearSavedGameState(); 
             
-            // Re-render to show the setup screen
-            render();
+            // If the wake lock was active, release it to ensure a fresh state for re-requesting later
+            if (wasWakeLockActive) {
+                releaseWakeLock(); // This also calls render()
+            } else {
+                render(); // Otherwise, just render
+            }
         };
 
         // --- UI Rendering Functions ---
@@ -877,13 +939,24 @@
                             Start Legislation Session (Draw 3)
                         </button>
                     </div>
-                    
-                    <!-- SMALLER, SAFER Reset and Rules Buttons -->
+
+                    <!-- Footer Button Group (Wake Lock, Rules, Reset) -->
                     <div class="flex justify-center space-x-4 mt-6 pt-4 border-t border-gray-700">
-                        <a href="https://www.secrethitler.com/assets/Secret_Hitler_Rules.pdf" target="_blank" class="max-w-xs py-1 px-4 text-white border border-white hover:bg-white hover:text-gray-900 font-medium text-xs rounded-lg transition duration-150 flex items-center">
+                        <!-- NEW: Wake Lock Button -->
+                        <button id="toggle-wake-lock-btn" class="flex-1 py-1 px-4 font-medium text-xs rounded-lg transition duration-150 flex items-center justify-center border 
+                            ${gameState.isWakeLockActive ? 'bg-green-600 hover:bg-green-700 text-white border-green-400' : 'bg-gray-600 hover:bg-gray-700 text-gray-400 border-gray-400'}">
+                            <!-- SVG Icon (Sun for ON, Clock for OFF) -->
+                            <svg class="w-4 h-4 mr-1" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" 
+                                    d="${gameState.isWakeLockActive ? 'M12 3v1m0 16v1m9-9h-1M4 12H3m15.364 6.364l-.707-.707M6.343 6.343l-.707-.707m12.728 0l-.707.707M6.343 17.657l-.707.707M16 12a4 4 0 11-8 0 4 4 0 018 0z' : 'M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z'}"></path>
+                            </svg>
+                            ${gameState.isWakeLockActive ? 'Screen ON' : 'Screen OFF'}
+                        </button>
+                        
+                        <a href="https://www.secrethitler.com/assets/Secret_Hitler_Rules.pdf" target="_blank" class="flex-1 py-1 px-4 text-white border border-white hover:bg-white hover:text-gray-900 font-medium text-xs rounded-lg transition duration-150 flex items-center justify-center">
                             Rules
                         </a>
-                        <button id="reset-game-btn" class="max-w-xs py-1 px-4 bg-indigo-800 hover:bg-indigo-900 text-gray-400 hover:text-white font-medium text-xs rounded-lg transition duration-150">
+                        <button id="reset-game-btn" class="flex-1 py-1 px-4 bg-indigo-800 hover:bg-indigo-900 text-gray-400 hover:text-white font-medium text-xs rounded-lg transition duration-150">
                             Reset Game Setup
                         </button>
                     </div>
@@ -916,6 +989,15 @@
 
             boardDiv.querySelector('#add-election-btn').addEventListener('click', incrementFailedElections);
             boardDiv.querySelector('#reset-elections-btn-large').addEventListener('click', resetFailedElections);
+            
+            // NEW: Wake Lock Button Listener
+            boardDiv.querySelector('#toggle-wake-lock-btn').addEventListener('click', () => {
+                if (gameState.isWakeLockActive) {
+                    releaseWakeLock();
+                } else {
+                    requestWakeLock();
+                }
+            });
 
 
             // 1. Show modal when reset button is clicked
@@ -1054,6 +1136,12 @@
             }
         };
 
+
+        // Initial setup check for wake lock
+        if (gameState.isWakeLockActive) {
+            // Attempt to re-request the lock if the user had it active
+            requestWakeLock();
+        }
 
         // Initial render on load (this will call loadGameState indirectly via render)
         window.onload = render;
