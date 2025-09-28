@@ -49,9 +49,40 @@
 
         initFirebase();
         // ---------------------------------------------------------------------
+
+        // --- Game Persistence (Local Storage) ---
+        const SAVE_KEY = 'secretHitlerGameState';
         
-        // --- Game State and Core Logic ---
-        const gameState = {
+        const saveGameState = () => {
+            try {
+                const serializedState = JSON.stringify(gameState);
+                localStorage.setItem(SAVE_KEY, serializedState);
+            } catch (error) {
+                console.error("Could not save state to localStorage:", error);
+            }
+        };
+
+        const loadGameState = () => {
+            try {
+                const serializedState = localStorage.getItem(SAVE_KEY);
+                if (serializedState === null) return undefined;
+                return JSON.parse(serializedState);
+            } catch (error) {
+                console.error("Could not load or parse state from localStorage:", error);
+                return undefined;
+            }
+        };
+
+        const clearSavedGameState = () => {
+             try {
+                localStorage.removeItem(SAVE_KEY);
+            } catch (error) {
+                console.error("Could not clear state from localStorage:", error);
+            }
+        };
+        
+        // --- Default Game State Definition ---
+        const DEFAULT_GAME_STATE = {
             view: 'setup',
             playerCount: 5,
             players: [], // Player objects use ID (1, 2, 3...)
@@ -60,20 +91,21 @@
                 liberal: 0,
                 fascist: 0 
             },
-            // Failed election tracking
             failedElections: 0,
-            
-            // STATE FOR POLICY PEEK (Functionality is currently used for all information gathering powers)
             policyPeekAvailable: false, 
             peekedPolicies: [], 
-            // LEGISLATION STATE
             deck: [],
             discard: [],
             currentPolicies: [],
             sessionPhase: null, 
-            // PRIVACY SCREEN CONTEXT
             nextPhaseData: null, 
         };
+
+        // --- Game State Initialization (Load from storage or use default) ---
+        const loadedState = loadGameState();
+        // Use Object.assign to merge the loaded state over the default, providing resilience
+        const gameState = Object.assign({}, DEFAULT_GAME_STATE, loadedState);
+
 
         // --- CORRECTED ROLE AND BOARD DISTRIBUTION (Using user's provided power positions) ---
         // Powers array indices 0-5 correspond to F1-F6 policy slots.
@@ -140,6 +172,8 @@
             }
             // Ensure policy track updates, especially when returning from a session
             updatePolicyTrack();
+            // --- SAVE GAME STATE AFTER EVERY RENDER ---
+            saveGameState();
         };
 
         // --- Utility Functions ---
@@ -362,18 +396,11 @@
         };
 
         const handleResetGame = () => {
-            gameState.view = 'setup';
-            gameState.policies.liberal = 0;
-            gameState.policies.fascist = 0;
-            gameState.failedElections = 0; 
-            gameState.policyPeekAvailable = false;
-            gameState.deck = [];
-            gameState.discard = [];
-            gameState.currentPolicies = [];
-            gameState.sessionPhase = null;
-            gameState.nextPhaseData = null;
-            gameState.players = [];
-            gameState.revealIndex = 0;
+            // Reset to the default state and clear any loaded state
+            Object.assign(gameState, DEFAULT_GAME_STATE);
+            clearSavedGameState(); 
+            
+            // Re-render to show the setup screen
             render();
         };
 
@@ -788,9 +815,10 @@
                         <div id="liberal-track" class="flex justify-between space-x-2">
                             ${Array.from({ length: 5 }).map((_, i) => `
                                 <div id="L${i+1}" class="policy-slot liberal-slot w-1/5 h-24 flex flex-col items-center justify-center rounded-lg font-bold transition-colors duration-200 text-xl p-1
-                                    bg-gray-700 border-2 border-green-600 text-green-700/50">
+                                    bg-gray-700 border-2 border-green-600 text-green-300">
                                     <span class="text-base">${i+1}</span>
-                                    <span class="text-[10px] text-center font-medium leading-tight mt-1 text-gray-400">Liberal<br>Policy</span>
+                                    <!-- This span inherits the white color when the slot is active due to the updatePolicyTrack logic -->
+                                    <span class="text-[10px] text-center font-medium leading-tight mt-1">Liberal<br>Policy</span>
                                 </div>
                             `).join('')}
                         </div>
@@ -983,15 +1011,17 @@
             }
 
 
-            // --- Liberal Track Update ---
+            // --- Liberal Track Update (NOW USES TEXT-WHITE WHEN ACTIVE) ---
             for (let i = 1; i < 6; i++) {
                 const slot = document.getElementById(`L${i}`);
                 if (slot) {
                     if (i <= gameState.policies.liberal) {
-                        slot.classList.remove('bg-gray-700', 'text-green-700/50');
+                        // When active: Remove inactive colors, Add active colors (text-white)
+                        slot.classList.remove('bg-gray-700', 'text-green-300');
                         slot.classList.add('bg-green-500', 'text-white', 'shadow-2xl', 'scale-105');
                     } else {
-                        slot.classList.add('bg-gray-700', 'text-green-700/50');
+                        // When inactive: Add inactive colors (text-green-300), Remove active colors (text-white)
+                        slot.classList.add('bg-gray-700', 'text-green-300');
                         slot.classList.remove('bg-green-500', 'text-white', 'shadow-2xl', 'scale-105');
                     }
                 }
@@ -1025,7 +1055,7 @@
         };
 
 
-        // Initial render on load
+        // Initial render on load (this will call loadGameState indirectly via render)
         window.onload = render;
     </script>
     <style>
