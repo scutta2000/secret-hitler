@@ -1,0 +1,817 @@
+i<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Secret Hitler Tracker</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script type="module">
+        // --- Firebase Setup (Mandatory, even if not directly storing game state) ---
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+        import { setLogLevel } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+        
+        // Define global variables provided by the Canvas environment
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+        const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : null;
+        const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
+        let app, db, auth;
+        let currentUserId = 'initializing';
+        
+        const initFirebase = async () => {
+            if (firebaseConfig) {
+                try {
+                    setLogLevel('Debug');
+                    app = initializeApp(firebaseConfig);
+                    db = getFirestore(app);
+                    auth = getAuth(app);
+                    
+                    if (initialAuthToken) {
+                        await signInWithCustomToken(auth, initialAuthToken);
+                    } else {
+                        await signInAnonymously(auth);
+                    }
+                    currentUserId = auth.currentUser?.uid || crypto.randomUUID();
+                    console.log("Firebase initialized. User ID:", currentUserId);
+                } catch (error) {
+                    console.error("Firebase initialization failed:", error);
+                    currentUserId = crypto.randomUUID(); // Fallback ID
+                }
+            } else {
+                console.warn("Firebase config not available. Running without persistence.");
+                currentUserId = crypto.randomUUID(); // Fallback ID
+            }
+        };
+
+        initFirebase();
+        // ---------------------------------------------------------------------
+
+        // --- Game State and Core Logic ---
+        const gameState = {
+            view: 'setup',
+            playerCount: 5,
+            players: [],
+            revealIndex: 0,
+            policies: {
+                liberal: 0,
+                fascist: 0 
+            },
+            // NEW STATE FOR LEGISLATION
+            deck: [],
+            discard: [],
+            currentPolicies: [],
+            sessionPhase: null, // 'PRESIDENT_DISCARD', 'CHANCELLOR_DISCARD'
+            // NEW STATE FOR PRIVACY SCREEN CONTEXT
+            nextPhaseData: null, // { type: 'role_reveal' | 'legislation', role: 'President' | 'Chancellor' | 'Player ID' }
+        };
+
+        // --- CORRECTED ROLE AND BOARD DISTRIBUTION (Verified against official rules PDF) ---
+        // 'powers' array is 1-indexed: index [1] is the power granted by the 1st policy, [5] is the 5th.
+        const ROLE_DISTRIBUTION = {
+            // 5-6 Players (Small Board)
+            5: { L: 3, F: 1, H: 1, 
+                powers: ['-', '-', 'Investigate Loyalty', 'Special Election', 'Execution', 'Execution'] 
+            },
+            6: { L: 4, F: 1, H: 1, 
+                powers: ['-', '-', 'Investigate Loyalty', 'Special Election', 'Execution', 'Execution'] 
+            },
+            // 7-8 Players (Medium Board)
+            7: { L: 4, F: 2, H: 1, 
+                powers: ['-', '-', 'Policy Peek', 'Special Election', 'Execution', 'Execution'] 
+            },
+            8: { L: 5, F: 2, H: 1, 
+                powers: ['-', '-', 'Policy Peek', 'Special Election', 'Execution', 'Execution'] 
+            },
+            // 9-10 Players (Large Board)
+            9: { L: 5, F: 3, H: 1, 
+                powers: ['-', 'Policy Peek', 'Execution', 'Execution', 'Execution', 'Execution'] 
+            },
+            10: { L: 6, F: 3, H: 1, 
+                powers: ['-', 'Policy Peek', 'Execution', 'Execution', 'Execution', 'Execution'] 
+            },
+        };
+
+        const render = () => {
+            const container = document.getElementById('app-container');
+            container.innerHTML = '';
+            
+            switch (gameState.view) {
+                case 'setup':
+                    container.appendChild(renderSetup());
+                    break;
+                case 'role_reveal':
+                    container.appendChild(renderRoleReveal());
+                    break;
+                case 'game_board':
+                    container.appendChild(renderGameBoard());
+                    break;
+                case 'legislation_session':
+                    container.appendChild(renderLegislationSession());
+                    break;
+                case 'privacy_screen': 
+                    container.appendChild(renderPrivacyScreen());
+                    break;
+            }
+            // Ensure policy track updates, especially when returning from a session
+            updatePolicyTrack();
+        };
+
+        // --- Utility Functions ---
+
+        /** Shuffles an array in place (Fisher-Yates) */
+        const shuffle = (array) => {
+            for (let i = array.length - 1; i > 0; i--) {
+                const j = Math.floor(Math.random() * (i + 1));
+                [array[i], array[j]] = [array[j], array[i]];
+            }
+        };
+        
+        // --- Deck Management Functions ---
+
+        /** Initializes and shuffles the full deck (6 Liberal, 11 Fascist) */
+        const initDeck = () => {
+            const newDeck = [];
+            // 6 Liberal Policies
+            for (let i = 0; i < 6; i++) {
+                newDeck.push('Liberal');
+            }
+            // 11 Fascist Policies
+            for (let i = 0; i < 11; i++) {
+                newDeck.push('Fascist');
+            }
+            shuffle(newDeck);
+            gameState.deck = newDeck;
+            gameState.discard = [];
+            console.log(`Deck initialized: ${gameState.deck.length} cards.`);
+        };
+        
+        /** Draws a single policy from the deck, reshuffling discard if necessary. */
+        const drawPolicy = () => {
+            if (gameState.deck.length === 0) {
+                if (gameState.discard.length > 0) {
+                    // Reshuffle discard pile to form a new deck
+                    gameState.deck = gameState.discard;
+                    gameState.discard = [];
+                    shuffle(gameState.deck);
+                    console.log("Deck shuffled from discard pile.");
+                } else {
+                    console.error("No more cards left to draw in the deck or discard pile.");
+                    return undefined;
+                }
+            }
+            return gameState.deck.pop();
+        };
+
+        /** Draws 3 policies for a legislative session. */
+        const drawThreePolicies = () => {
+            const drawn = [];
+            for (let i = 0; i < 3; i++) {
+                const policy = drawPolicy();
+                if (policy) {
+                    drawn.push(policy);
+                }
+            }
+            gameState.currentPolicies = drawn;
+        };
+
+
+        const assignRoles = (playerCount) => {
+            const dist = ROLE_DISTRIBUTION[playerCount];
+            if (!dist) return;
+
+            const roles = [];
+            for (let i = 0; i < dist.L; i++) roles.push('Liberal');
+            for (let i = 0; i < dist.F; i++) roles.push('Fascist');
+            roles.push('Hitler');
+
+            shuffle(roles);
+
+            // Store player roles
+            gameState.players = roles.map((role, index) => ({
+                id: index + 1,
+                role: role,
+                party: role === 'Liberal' ? 'Liberal' : 'Fascist',
+            }));
+            
+            // Simplified teammate knowledge for single-phone view
+            if (playerCount >= 7) {
+                const fascists = gameState.players.filter(p => p.role === 'Fascist' || p.role === 'Hitler');
+                gameState.players.forEach(p => {
+                    if (p.role === 'Fascist') {
+                        p.knownTeammates = fascists.filter(f => f.role !== 'Hitler').map(f => f.id);
+                    }
+                    if (p.role === 'Hitler') {
+                        p.knownTeammates = fascists.filter(f => f.role === 'Fascist').map(f => f.id);
+                    }
+                });
+            } else {
+                 const fascists = gameState.players.filter(p => p.party === 'Fascist');
+                 gameState.players.forEach(p => {
+                    if (p.party === 'Fascist') {
+                        p.knownTeammates = fascists.filter(f => f.id !== p.id).map(f => f.id);
+                    }
+                });
+            }
+        };
+
+        const getPowerDescription = (policiesPassed) => {
+            const count = gameState.playerCount;
+            const powers = ROLE_DISTRIBUTION[count].powers;
+            
+            if (policiesPassed >= 1 && policiesPassed <= 5) {
+                // powers is 1-indexed, but policy count starts at 1
+                return powers[policiesPassed];
+            }
+            if (policiesPassed >= 6) {
+                return 'Fascist Victory';
+            }
+            return '-'; 
+        };
+        
+        // --- Legislation Logic ---
+        
+        const startLegislation = () => {
+            // Check win condition before starting a new session
+            if (gameState.policies.liberal >= 5 || gameState.policies.fascist >= 6) {
+                console.error("The game has already ended! Start a new game.");
+                return;
+            }
+
+            drawThreePolicies();
+            if (gameState.currentPolicies.length < 3) {
+                 console.error("Could not draw 3 policies. Check the deck count or if the game has ended.");
+                 return;
+            }
+            
+            // Transition to privacy screen for the President
+            gameState.nextPhaseData = { type: 'legislation', role: 'President' };
+            gameState.sessionPhase = 'PRESIDENT_DISCARD';
+            gameState.view = 'privacy_screen';
+            render();
+        };
+
+        const handleDiscard = (discardIndex) => {
+            const policies = gameState.currentPolicies;
+            const discardedPolicy = policies.splice(discardIndex, 1)[0];
+            gameState.discard.push(discardedPolicy);
+            console.log(`${gameState.sessionPhase.split('_')[0]} discarded: ${discardedPolicy}.`);
+
+            if (gameState.sessionPhase === 'PRESIDENT_DISCARD') {
+                // Go to privacy screen for the Chancellor
+                gameState.sessionPhase = 'CHANCELLOR_DISCARD';
+                gameState.nextPhaseData = { type: 'legislation', role: 'Chancellor' };
+                gameState.view = 'privacy_screen';
+            } else if (gameState.sessionPhase === 'CHANCELLOR_DISCARD') {
+                const enactedPolicy = policies[0];
+                console.log(`Enacted policy: ${enactedPolicy}.`);
+                
+                // Enact the final policy
+                updatePolicy(1, enactedPolicy.toLowerCase());
+                
+                // Reset session state and return to board
+                gameState.currentPolicies = [];
+                gameState.sessionPhase = null;
+                gameState.view = 'game_board';
+            }
+            render();
+        };
+
+        // --- Game Reset Function ---
+        const handleResetGame = () => {
+            gameState.view = 'setup';
+            gameState.policies.liberal = 0;
+            gameState.policies.fascist = 0;
+            // Clear other game-specific state
+            gameState.deck = [];
+            gameState.discard = [];
+            gameState.currentPolicies = [];
+            gameState.sessionPhase = null;
+            gameState.nextPhaseData = null;
+            gameState.players = [];
+            gameState.revealIndex = 0;
+            render();
+        };
+
+        // --- UI Rendering Functions ---
+        
+        const renderPrivacyScreen = () => {
+            const data = gameState.nextPhaseData;
+            if (!data) return document.createElement('div');
+
+            const isLegislation = data.type === 'legislation';
+            const roleText = isLegislation ? data.role : `Player ${data.playerId}`;
+            
+            // Determine the next view based on the current context
+            let nextView;
+            if (data.type === 'role_reveal') {
+                nextView = 'role_reveal';
+            } else if (data.type === 'legislation') {
+                nextView = 'legislation_session';
+            } else {
+                nextView = 'game_board';
+            }
+
+            const privacyDiv = document.createElement('div');
+            privacyDiv.className = 'flex flex-col items-center justify-center min-h-screen p-6 text-center bg-gray-900 text-white';
+            
+            privacyDiv.innerHTML = `
+                <div class="w-full max-w-sm bg-gray-800 p-8 shadow-2xl rounded-xl border-4 border-yellow-500 animate-pulse">
+                    <h1 class="text-4xl font-extrabold text-yellow-400 mb-4 uppercase">
+                        PRIVATE ACCESS
+                    </h1>
+                    <p class="text-lg font-medium text-gray-300 mb-8">
+                        Pass the phone to the **${roleText}**.
+                    </p>
+                    
+                    <button id="proceed-btn" class="mt-4 w-full py-4 px-4 bg-yellow-500 hover:bg-yellow-600 text-gray-900 font-bold rounded-xl shadow-lg transition duration-150 ease-in-out transform hover:scale-[1.05] text-xl">
+                        I AM ${roleText} - TAP TO PROCEED
+                    </button>
+                </div>
+                <!-- Only allow returning to the board if not in the middle of initial role reveal -->
+                ${data.type !== 'role_reveal' ? `
+                <button id="cancel-btn" class="mt-8 text-xs text-gray-400 hover:text-red-400 transition-colors">
+                    Cancel and Return to Board
+                </button>
+                ` : ''}
+            `;
+
+            privacyDiv.querySelector('#proceed-btn').addEventListener('click', () => {
+                gameState.view = nextView;
+                gameState.nextPhaseData = null; // Clear context
+                render();
+            });
+
+            if (data.type !== 'role_reveal') {
+                privacyDiv.querySelector('#cancel-btn').addEventListener('click', () => {
+                    gameState.view = 'game_board';
+                    gameState.nextPhaseData = null;
+                    // Also reset current legislation state if cancelling mid-session
+                    if (data.type === 'legislation') {
+                        gameState.deck = gameState.deck.concat(gameState.currentPolicies);
+                        shuffle(gameState.deck);
+                        gameState.currentPolicies = [];
+                        gameState.sessionPhase = null;
+                    }
+                    render();
+                });
+            }
+
+            return privacyDiv;
+        };
+
+
+        const renderSetup = () => {
+            const setupDiv = document.createElement('div');
+            setupDiv.className = 'p-6 flex flex-col items-center justify-center min-h-screen bg-gray-50';
+            setupDiv.innerHTML = `
+                <div class="w-full max-w-sm bg-white p-6 shadow-2xl rounded-xl">
+                    <h1 class="text-3xl font-extrabold text-center text-gray-800 mb-6 font-inter">Secret Hitler Tracker</h1>
+                    <p class="text-center text-gray-600 mb-8">Select the number of players to start the role assignment phase.</p>
+                    
+                    <label for="player-select" class="block text-sm font-medium text-gray-700 mb-2">Number of Players (5-10)</label>
+                    <select id="player-select" class="w-full p-3 border border-gray-300 rounded-lg shadow-sm focus:ring-red-500 focus:border-red-500 text-lg">
+                        ${[5, 6, 7, 8, 9, 10].map(n => 
+                            `<option value="${n}" ${n === gameState.playerCount ? 'selected' : ''}>${n} Players</option>`
+                        ).join('')}
+                    </select>
+                    
+                    <button id="start-game-btn" class="mt-8 w-full py-3 px-4 bg-red-600 hover:bg-red-700 text-white font-bold rounded-xl shadow-lg transition duration-150 ease-in-out transform hover:scale-[1.02]">
+                        Start Role Assignment
+                    </button>
+                </div>
+                <p class="mt-8 text-xs text-gray-400">App ID: ${appId}</p>
+            `;
+
+            setupDiv.querySelector('#player-select').addEventListener('change', (e) => {
+                gameState.playerCount = parseInt(e.target.value);
+            });
+
+            setupDiv.querySelector('#start-game-btn').addEventListener('click', () => {
+                assignRoles(gameState.playerCount);
+                initDeck(); // Initialize the policy deck when the game starts
+                gameState.revealIndex = 0;
+                
+                // Start with a privacy screen for the first player
+                gameState.nextPhaseData = { type: 'role_reveal', playerId: gameState.players[0].id };
+                gameState.view = 'privacy_screen'; 
+                render();
+            });
+
+            return setupDiv;
+        };
+
+        const renderRoleReveal = () => {
+            const player = gameState.players[gameState.revealIndex];
+            
+            // Get all Fascist teammates (including Hitler for Fascists in 5/6 player games)
+            let teammatesInfo = '';
+            if (player.party === 'Fascist') {
+                const team = gameState.players.filter(p => p.party === 'Fascist' && p.id !== player.id);
+                
+                // 5-6 Players: Fascists know each other, and know Hitler
+                if (gameState.playerCount <= 6) {
+                    const hitler = gameState.players.find(p => p.role === 'Hitler');
+                    teammatesInfo = `
+                        <p class="text-xl mt-4 font-semibold text-gray-800">Your Teammates:</p>
+                        <p class="text-lg">${team.map(t => 'Player ' + t.id).join(', ')}</p>
+                        <p class="text-xl mt-4 font-semibold text-gray-800">Hitler is:</p>
+                        <p class="text-3xl font-extrabold text-red-700">${hitler ? 'Player ' + hitler.id : 'Error'}</p>
+                    `;
+                // 7+ Players: Fascists know each other, but not Hitler (and vice-versa)
+                } else if (player.role === 'Fascist') {
+                    const knownTeammates = gameState.players.filter(p => p.role === 'Fascist' && p.id !== player.id).map(p => 'Player ' + p.id);
+                    teammatesInfo = `
+                        <p class="text-xl mt-4 font-semibold text-gray-800">Other Fascists:</p>
+                        <p class="text-lg">${knownTeammates.join(', ') || 'None'}</p>
+                        <p class="mt-2 text-red-600 font-bold text-center">Do not know who Hitler is.</p>
+                    `;
+                } else if (player.role === 'Hitler') {
+                    const knownTeammates = gameState.players.filter(p => p.role === 'Fascist').map(p => 'Player ' + p.id);
+                    teammatesInfo = `
+                        <p class="text-xl mt-4 font-semibold text-gray-800">Other Fascists:</p>
+                        <p class="text-lg">${knownTeammates.join(', ') || 'None'}</p>
+                    `;
+                }
+            } else {
+                teammatesInfo = `<p class="text-lg mt-8 font-semibold text-green-700">You do not know any other player's role.</p>`;
+            }
+
+
+            const roleRevealDiv = document.createElement('div');
+            roleRevealDiv.className = 'flex flex-col items-center justify-center min-h-screen p-4 text-center';
+            roleRevealDiv.style.backgroundColor = player.party === 'Liberal' ? '#ebfbee' : '#feebeb'; // Light green/red background
+            
+            roleRevealDiv.innerHTML = `
+                <div class="p-6 rounded-2xl shadow-2xl w-full max-w-sm bg-white transform transition-all duration-300 ease-out">
+                    <p class="text-2xl font-bold text-gray-600 mb-4">
+                        Player ${player.id}'s Turn
+                    </p>
+                    
+                    <div id="role-display" class="border-4 p-8 rounded-xl transition-opacity duration-500 ease-in-out" style="border-color: ${player.party === 'Liberal' ? '#10b981' : '#ef4444'};">
+                        <p class="text-2xl text-gray-500 font-medium">Your Role Is:</p>
+                        <h2 class="text-5xl font-black mt-2 mb-4 uppercase" style="color: ${player.role === 'Liberal' ? '#10b981' : player.role === 'Fascist' ? '#ef4444' : '#991b1b'};">
+                            ${player.role}
+                        </h2>
+                        <p class="text-lg font-medium text-gray-700">${player.party} Party</p>
+                        ${teammatesInfo}
+                    </div>
+
+                    <button id="next-player-btn" class="mt-10 w-full py-4 px-4 bg-gray-800 hover:bg-gray-900 text-white font-extrabold rounded-xl shadow-lg transition duration-150 ease-in-out transform hover:scale-105 text-xl">
+                        CONFIRM & PASS PHONE
+                    </button>
+                    
+                    <p class="text-xs text-gray-400 mt-4">(${gameState.playerCount - 1 - gameState.revealIndex} players left)</p>
+                </div>
+            `;
+
+            roleRevealDiv.querySelector('#next-player-btn').addEventListener('click', () => {
+                gameState.revealIndex++; // Move to the next player's index
+                
+                if (gameState.revealIndex >= gameState.playerCount) {
+                    gameState.view = 'game_board';
+                    gameState.revealIndex = 0; // Reset index
+                    gameState.policies.liberal = 0; // Reset policies
+                    gameState.policies.fascist = 0;
+                } else {
+                    // Transition to privacy screen for the current (new) revealIndex
+                    gameState.nextPhaseData = { 
+                        type: 'role_reveal', 
+                        playerId: gameState.players[gameState.revealIndex].id 
+                    };
+                    gameState.view = 'privacy_screen';
+                }
+                render();
+            });
+
+            return roleRevealDiv;
+        };
+
+        const renderLegislationSession = () => {
+            const policies = gameState.currentPolicies;
+            const isPresident = gameState.sessionPhase === 'PRESIDENT_DISCARD';
+            const role = isPresident ? 'President' : 'Chancellor';
+            const action = isPresident ? 'DISCARD ONE' : 'DISCARD ONE (Enact the remaining)';
+
+            const sessionDiv = document.createElement('div');
+            sessionDiv.className = 'flex flex-col items-center justify-center min-h-screen p-4 text-center bg-gray-900 text-white';
+            
+            sessionDiv.innerHTML = `
+                <div class="w-full max-w-sm bg-gray-800 p-6 shadow-2xl rounded-xl">
+                    <p class="text-3xl font-extrabold mb-2 text-yellow-300">
+                        LEGISLATION SESSION
+                    </p>
+                    <h2 class="text-xl font-semibold text-gray-300 mb-6">
+                        ${role}'s Turn: <span class="text-yellow-400 font-bold">${action}</span>
+                    </h2>
+                    <p class="text-sm text-gray-400 mb-6">
+                        Click the policy card you wish to discard.
+                    </p>
+
+                    <div id="policy-cards" class="flex justify-center space-x-2 md:space-x-4 mb-8">
+                        ${policies.map((policy, index) => `
+                            <div class="policy-card flex-1 p-3 md:p-4 rounded-xl shadow-lg cursor-pointer transform transition duration-200 ease-in-out hover:scale-105 active:scale-95 text-center font-black uppercase text-2xl md:text-3xl" 
+                                data-index="${index}"
+                                style="background-color: ${policy === 'Liberal' ? '#10b981' : '#ef4444'}; color: white; border: 3px solid ${policy === 'Liberal' ? '#059669' : '#b91c1c'}; height: 120px; display: flex; align-items: center; justify-content: center; user-select: none;">
+                                ${policy.charAt(0)}
+                            </div>
+                        `).join('')}
+                    </div>
+                    
+                    ${policies.length === 1 ? '<p class="text-lg font-bold text-green-400">Policy ready to be Enacted.</p>' : ''}
+
+
+                    <p class="text-xs text-gray-400 mt-4">
+                        Policies Remaining in Deck: ${gameState.deck.length} | Discard Pile: ${gameState.discard.length}
+                    </p>
+                </div>
+
+                <button id="cancel-session-btn" class="mt-8 w-full max-w-sm py-3 bg-red-800 hover:bg-red-900 text-white font-bold rounded-xl transition duration-150 text-sm">
+                    Cancel Session (Failure to Elect)
+                </button>
+            `;
+
+            sessionDiv.querySelectorAll('.policy-card').forEach(card => {
+                card.addEventListener('click', (e) => {
+                    const index = parseInt(e.currentTarget.getAttribute('data-index'));
+                    handleDiscard(index);
+                });
+            });
+            
+            sessionDiv.querySelector('#cancel-session-btn').addEventListener('click', () => {
+                // Put the currently drawn cards back into the deck and reshuffle (simulating a failed election)
+                gameState.deck = gameState.deck.concat(gameState.currentPolicies);
+                shuffle(gameState.deck);
+                gameState.currentPolicies = [];
+                gameState.sessionPhase = null;
+                gameState.view = 'game_board';
+                render();
+            });
+
+            return sessionDiv;
+        };
+        
+        const renderGameBoard = () => {
+            const boardDiv = document.createElement('div');
+            // Changed pt-8 to pt-4 to reduce overall top margin
+            boardDiv.className = 'flex flex-col items-center p-4 pt-4 min-h-screen bg-gray-900 font-inter text-white';
+            boardDiv.innerHTML = `
+                <div class="w-full max-w-md game-board-wrapper"> <!-- Added class 'game-board-wrapper' -->
+                    <h1 class="text-3xl font-extrabold text-center text-gray-100 mb-1">SECRET HITLER TRACKER</h1>
+                    <p class="text-center text-gray-400 mb-6 text-sm">Policies Passed: 
+                        <span id="liberal-count" class="text-green-400 font-bold">${gameState.policies.liberal} L</span> / 
+                        <span id="fascist-count" class="text-red-400 font-bold">${gameState.policies.fascist} F</span>
+                    </p>
+                    
+                    <!-- Liberal Policy Track -->
+                    <div class="mb-6">
+                        <h2 class="text-xl font-bold mb-2 text-green-300 border-b border-green-700 pb-1">Liberal Policies</h2>
+                        <div id="liberal-track" class="flex justify-between space-x-2">
+                            ${Array.from({ length: 5 }).map((_, i) => `
+                                <div id="L${i+1}" class="policy-slot liberal-slot w-1/5 h-12 flex items-center justify-center rounded-lg font-bold transition-colors duration-200 text-xl
+                                    bg-gray-700 border-2 border-green-600 text-green-700/50">
+                                    ${i+1}
+                                </div>
+                            `).join('')}
+                        </div>
+                        <p id="liberal-win" class="text-center mt-3 text-green-500 font-extrabold text-2xl hidden animate-pulse">LIBERALS WIN!</p>
+                    </div>
+
+                    <!-- Fascist Policy Track - EMHAPSIZED -->
+                    <div class="mb-6">
+                        <h2 class="text-xl font-bold mb-4 text-red-300 border-b border-red-700 pb-1">Fascist Policies</h2>
+                        
+                        <!-- Thin Bar Indicator Area using Grid -->
+                        <div class="grid grid-cols-6 gap-2 w-full h-8 mb-2">
+                            <!-- F3: Hitler Election Condition -->
+                            <div class="col-span-1 col-start-3 flex flex-col items-center justify-end">
+                                <div class="h-1 w-full bg-yellow-500 rounded-full"></div>
+                                <span class="text-[10px] font-bold text-yellow-400 mt-1 leading-none text-center">HITLER<br>ELECTION</span>
+                            </div>
+                            
+                            <!-- F5: Veto Enabled -->
+                            <div class="col-span-1 col-start-5 flex flex-col items-center justify-end">
+                                <div class="h-1 w-full bg-blue-500 rounded-full"></div>
+                                <span class="text-[10px] font-bold text-blue-400 mt-1 leading-none text-center">VETO<br>ENABLED</span>
+                            </div>
+                        </div>
+
+                        <div id="fascist-track" class="grid grid-cols-6 gap-2">
+                            ${Array.from({ length: 6 }).map((_, i) => {
+                                const policyNumber = i + 1;
+                                const power = getPowerDescription(policyNumber);
+                                const isPower = power !== '-' && power !== 'Fascist Victory';
+
+                                return `
+                                    <div id="F${policyNumber}" class="policy-slot fascist-slot col-span-1 h-24 flex flex-col items-center justify-center rounded-lg shadow-inner transition-all duration-300 ease-in-out 
+                                        bg-gray-700 border-2 border-red-600 text-gray-400 p-1">
+                                        <span class="text-base font-bold">${policyNumber}</span>
+                                        ${isPower ? `<span class="text-[10px] text-center font-medium leading-tight mt-1">${power.split(' ').join('<br>')}</span>` : ''}
+                                        ${policyNumber === 6 ? `<span class="text-[10px] text-center font-medium leading-tight mt-1">Fascist<br>Win</span>` : ''}
+                                    </div>
+                                `;
+                            }).join('')}
+                        </div>
+                        <p id="fascist-win" class="text-center mt-3 text-red-500 font-extrabold text-2xl hidden animate-pulse">FASCISTS WIN!</p>
+                    </div>
+
+                    <!-- Main Action Button -->
+                    <div class="mt-8">
+                        <button id="start-legislation-btn" class="w-full py-4 px-4 bg-yellow-500 hover:bg-yellow-600 text-gray-900 font-bold rounded-xl shadow-lg transition duration-150 ease-in-out transform hover:scale-[1.02] text-xl mb-4">
+                            Start Legislation Session (Draw 3)
+                        </button>
+                        
+                        <p class="text-xs text-gray-500 mt-4 text-center">Deck: ${gameState.deck.length} | Discard: ${gameState.discard.length}</p>
+                    </div>
+                    
+                    <!-- SMALLER, SAFER Reset Button -->
+                    <div class="flex justify-center mt-6 pt-4 border-t border-gray-700">
+                        <button id="reset-game-btn" class="max-w-xs py-1 px-4 bg-indigo-800 hover:bg-indigo-900 text-gray-400 hover:text-white font-medium text-xs rounded-lg transition duration-150">
+                            Reset Game Setup
+                        </button>
+                    </div>
+                    
+                </div>
+
+                <!-- Reset Confirmation Modal -->
+                <div id="reset-modal" class="fixed inset-0 bg-gray-900 bg-opacity-75 flex items-center justify-center z-50 hidden">
+                    <div class="bg-gray-800 p-8 rounded-xl shadow-2xl w-full max-w-xs text-center border-t-4 border-red-500">
+                        <h3 class="text-xl font-bold text-white mb-4">Confirm Reset</h3>
+                        <p class="text-gray-300 mb-6">Are you sure you want to discard this game and return to the setup screen?</p>
+                        <div class="flex justify-between space-x-4">
+                            <button id="confirm-reset-btn" class="flex-1 py-2 bg-red-600 hover:bg-red-700 text-white font-bold rounded-lg transition transform hover:scale-105">
+                                Yes, Reset
+                            </button>
+                            <button id="cancel-reset-btn" class="flex-1 py-2 bg-gray-600 hover:bg-gray-700 text-white rounded-lg transition">
+                                Cancel
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            `;
+            
+            // Event Listeners 
+            boardDiv.querySelector('#start-legislation-btn').addEventListener('click', startLegislation);
+            
+            // 1. Show modal when reset button is clicked
+            boardDiv.querySelector('#reset-game-btn').addEventListener('click', () => {
+                const modal = document.getElementById('reset-modal');
+                if (modal) {
+                    modal.classList.remove('hidden');
+                }
+            });
+            
+            // 2. Attach listeners for the modal buttons
+            setTimeout(() => { 
+                const modal = document.getElementById('reset-modal');
+                if (modal) {
+                    document.getElementById('confirm-reset-btn').addEventListener('click', () => {
+                        modal.classList.add('hidden');
+                        handleResetGame(); // Perform the actual reset
+                    });
+
+                    document.getElementById('cancel-reset-btn').addEventListener('click', () => {
+                        modal.classList.add('hidden'); // Just hide the modal
+                    });
+                }
+            }, 0); // Use setTimeout to ensure event listeners are attached after the elements are in the DOM
+
+            return boardDiv;
+        };
+
+        const updatePolicy = (delta, type) => {
+            if (type === 'liberal') {
+                const newCount = Math.min(5, Math.max(0, gameState.policies.liberal + delta));
+                if (newCount !== gameState.policies.liberal) {
+                    gameState.policies.liberal = newCount;
+                }
+            } else if (type === 'fascist') {
+                const newCount = Math.min(6, Math.max(0, gameState.policies.fascist + delta));
+                if (newCount !== gameState.policies.fascist) {
+                    gameState.policies.fascist = newCount;
+                }
+            }
+            updatePolicyTrack();
+        };
+
+        const updatePolicyTrack = () => {
+            if (gameState.view !== 'game_board') return;
+
+            const libTrack = document.getElementById('liberal-track');
+            const fascTrack = document.getElementById('fascist-track');
+            const libCountEl = document.getElementById('liberal-count');
+            const fascCountEl = document.getElementById('fascist-count');
+            const libWinEl = document.getElementById('liberal-win');
+            const fascWinEl = document.getElementById('fascist-win');
+
+            if (!libTrack || !fascTrack) return;
+
+            libCountEl.textContent = `${gameState.policies.liberal} L`;
+            fascCountEl.textContent = `${gameState.policies.fascist} F`;
+            
+            // --- Liberal Track Update ---
+            for (let i = 1; i <= 5; i++) {
+                const slot = document.getElementById(`L${i}`);
+                if (slot) {
+                    if (i <= gameState.policies.liberal) {
+                        // PASSED
+                        slot.classList.remove('bg-gray-700', 'text-green-700/50');
+                        slot.classList.add('bg-green-500', 'text-white', 'shadow-2xl', 'scale-105');
+                    } else {
+                        // EMPTY
+                        slot.classList.add('bg-gray-700', 'text-green-700/50');
+                        slot.classList.remove('bg-green-500', 'text-white', 'shadow-2xl', 'scale-105');
+                    }
+                }
+            }
+
+            // --- Fascist Track Update ---
+            for (let i = 1; i <= 6; i++) {
+                const slot = document.getElementById(`F${i}`);
+                if (slot) {
+                    // Reset to base state and remove enacted classes
+                    slot.classList.remove('bg-red-500', 'text-white', 'shadow-2xl', 'scale-105', 'text-red-700/50'); 
+                    // Use text-gray-400 for clear visibility of power on empty slots
+                    slot.classList.add('bg-gray-700', 'text-gray-400', 'border-2', 'border-red-600');
+                    
+                    if (i <= gameState.policies.fascist) {
+                        // Policies PASSED (Enacted state)
+                        slot.classList.remove('bg-gray-700', 'text-gray-400');
+                        slot.classList.add('bg-red-500', 'text-white', 'shadow-2xl', 'scale-105');
+                    } 
+                }
+            }
+
+            // --- Win Conditions ---
+            if (gameState.policies.liberal >= 5) {
+                libWinEl.classList.remove('hidden');
+                fascWinEl.classList.add('hidden');
+            } else if (gameState.policies.fascist >= 6) {
+                fascWinEl.classList.remove('hidden');
+                libWinEl.classList.add('hidden');
+            } else {
+                libWinEl.classList.add('hidden');
+                fascWinEl.classList.add('hidden');
+            }
+        };
+
+
+        // Initial render on load
+        window.onload = render;
+    </script>
+    <style>
+        /* Custom styles for aesthetic */
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@100..900&display=swap');
+        body {
+            font-family: 'Inter', sans-serif;
+        }
+        /* Mobile first sizing: enforce full screen for all views */
+        #app-container {
+            min-height: 100vh;
+            width: 100vw;
+            transition: transform 0.3s ease-in-out; 
+        }
+
+        /* Landscape Orientation Rules: Adjust board width but do NOT rotate. */
+        @media (orientation: landscape) {
+            #app-container {
+                /* Removed: transform: rotate(180deg); */
+                width: 100vw;
+                height: 100vh;
+                overflow: hidden; 
+            }
+            
+            /* Increase the functional width of the board wrapper for wide screens */
+            .game-board-wrapper {
+                width: 95vw; 
+                max-width: 800px; 
+            }
+        }
+
+        .policy-slot {
+            transition: all 0.3s ease-in-out;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+        }
+        /* Custom class for the policy cards in the session view */
+        .policy-card {
+            border: 3px solid transparent;
+            min-width: 80px;
+        }
+        /* For the privacy screen prompt */
+        .animate-pulse {
+            animation: pulse 1.5s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+        }
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: .5; }
+        }
+    </style>
+</head>
+<body class="antialiased">
+    <div id="app-container">
+        <!-- Content will be rendered here by JavaScript -->
+    </div>
+</body>
+</html>
+
